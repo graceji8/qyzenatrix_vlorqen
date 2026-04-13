@@ -76,17 +76,24 @@ def get_client():
         print("✅ LLM source: GitHub Models")
         return GH_MODELS_URL, GH_MODELS_KEY, GH_MODEL
 
-    # ── 2. Ollama (local) ─────────────────────────────────────────────────────
+    # ── 2. Antigravity ────────────────────────────────────────────────────────
+    try:
+        req = urllib.request.Request(f"{API_BASE_URL}/models")
+        req.add_header("Authorization", f"Bearer {API_KEY}")
+        urllib.request.urlopen(req, timeout=3)
+        print("✅ LLM source: Antigravity Manager")
+        return API_BASE_URL, API_KEY, AG_MODEL
+    except Exception as e:
+        print(f"⚠️ Antigravity unavailable ({e}) — falling back to Ollama...")
+
+    # ── 3. Ollama (local) ─────────────────────────────────────────────────────
     try:
         urllib.request.urlopen(f"{OLLAMA_BASE_URL}/models", timeout=3)
         print("✅ LLM source: Ollama (local)")
         return OLLAMA_BASE_URL, "ollama", OLLAMA_MODEL
     except Exception as e:
-        print(f"⚠️ Ollama unavailable ({e}) — falling back to Antigravity...")
-
-    # ── 3. Antigravity (last resort) ──────────────────────────────────────────
-    print("✅ LLM source: Antigravity Manager")
-    return API_BASE_URL, API_KEY, AG_MODEL
+        print(f"⚠️ Ollama unavailable ({e})")
+        raise Exception("No LLM source available")
 
 
 # ── Pacific time ──────────────────────────────────────────────────────────────
@@ -315,6 +322,7 @@ Post:"""
         print(f"[LLM PROMPT — attempt {attempt+1}/3] ({len(prompt)} chars)")
         print(prompt)
         print(f"{'─'*50}\n")
+        sys.stdout.flush()
         
         payload = {
             "model": model_name,
@@ -326,6 +334,8 @@ Post:"""
         }
         
         try:
+            print(f"  ⏳ Submitting prompt to LLM (timeout 60s)...")
+            sys.stdout.flush()
             req = urllib.request.Request(
                 url, data=json.dumps(payload).encode(), headers=headers, method='POST'
             )
@@ -342,9 +352,11 @@ Post:"""
                 return text
             
             print(f"  ⚠️ Post too short ({len(text)} chars) or missing hashtags. Retrying (attempt {attempt+1}/3)...")
+            sys.stdout.flush()
             time.sleep(1)
         except Exception as e:
-            print(f"  ⚠️ LLM request failed: {e}")
+            print(f"  ⚠️ LLM request failed (Attempt {attempt+1}/3): {type(e).__name__} - {e}")
+            sys.stdout.flush()
             time.sleep(2)
             
     return text if 'text' in locals() else ""
