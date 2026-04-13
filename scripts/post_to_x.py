@@ -31,6 +31,7 @@ import time
 import argparse
 import pickle
 import io
+import itertools
 import urllib.request
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -285,49 +286,46 @@ def iter_dates(lookback_days: int):
         yield date_parts(day)
 
 
-# ── Collect all unposted projects across date range ───────────────────────────
-def collect_unposted_projects(service, posted_ids: list, lookback_days: int):
-    """
-    Walk today → today-lookback_days.
-    For each date, find projects that:
-      - have an .mp4
-      - do NOT have x_post.json
-      - are not in posted_ids
-    Returns a flat list of project dicts, sorted newest-date-first, then by folder name desc.
-    """
-    all_projects = []
+# ── Lazy per-date project scanner ─────────────────────────────────────────────
+def collect_unposted_for_date(service, posted_ids: list, year: str, month: str, date_str: str):
+    """Return unposted projects for a single date, sorted newest folder first."""
+    if service:
+        folders = list_projects_for_date(service, year, month, date_str)
+    else:
+        folders = list_projects_local(year, month, date_str)
 
+    if not folders:
+        return []
+
+    unposted = []
+    for folder in folders:
+        is_local = folder.get('is_local', False)
+        if folder['id'] in posted_ids:
+            continue
+        if not check_has_mp4(service, folder['id'], is_local):
+            continue
+        if has_file(service, folder['id'], "x_post.json", is_local):
+            continue
+        folder['_date']  = date_str
+        folder['_year']  = year
+        folder['_month'] = month
+        unposted.append(folder)
+
+    unposted.sort(key=lambda f: f['name'], reverse=True)
+    return unposted
+
+
+def iter_unposted_projects(service, posted_ids: list, lookback_days: int):
+    """
+    Generator — scans one date at a time and yields projects immediately.
+    Posting begins as soon as today's first project is found; older dates
+    are only checked once all projects from the current date are exhausted.
+    """
     for year, month, date_str in iter_dates(lookback_days):
         print(f"  Checking {date_str}...", end=" ", flush=True)
-
-        if service:
-            folders = list_projects_for_date(service, year, month, date_str)
-        else:
-            folders = list_projects_local(year, month, date_str)
-
-        if not folders:
-            print("no folders.")
-            continue
-
-        unposted = []
-        for folder in folders:
-            is_local = folder.get('is_local', False)
-            if folder['id'] in posted_ids:
-                continue
-            if not check_has_mp4(service, folder['id'], is_local):
-                continue
-            if has_file(service, folder['id'], "x_post.json", is_local):
-                continue
-            folder['_date'] = date_str
-            folder['_year'] = year
-            folder['_month'] = month
-            unposted.append(folder)
-
-        print(f"{len(unposted)} unposted.")
-        unposted.sort(key=lambda f: f['name'], reverse=True)
-        all_projects.extend(unposted)
-
-    return all_projects
+        projects = collect_unposted_for_date(service, posted_ids, year, month, date_str)
+        print(f"{len(projects)} unposted.")
+        yield from projects
 
 
 # ── LLM post generation ───────────────────────────────────────────────────────
@@ -516,7 +514,7 @@ def process_project(service, project: dict, driver, session: dict, posted_ids: l
     folder_name = project['name']
     is_local    = project.get('is_local', False)
 
-    local_dest       = Path("news") / year / month / date_str / folder_name
+    local_dest        = Path("news") / year / month / date_str / folder_name
     original_drive_id = project['id'] if not is_local else None
 
     # Download from Drive if needed
@@ -601,8 +599,8 @@ def process_project(service, project: dict, driver, session: dict, posted_ids: l
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
-    PT     = get_pacific_time()
-    TODAY  = PT.strftime("%Y-%m-%d")
+    PT    = get_pacific_time()
+    TODAY = PT.strftime("%Y-%m-%d")
 
     print(f"\n{'='*60}")
     print(f"X Auto-Poster {'(DRY RUN) ' if IS_DRY_RUN else ''}— {TODAY} (PT)")
@@ -618,45 +616,63 @@ def main():
     service    = get_drive_service()
     posted_ids = load_posted_ids()
 
-    # ── Collect all unposted projects (today first, then older days) ──────────
-    print(f"Scanning for unposted projects (up to {LOOKBACK_DAYS} days back)...")
-    projects = collect_unposted_projects(service, posted_ids, LOOKBACK_DAYS)
-
-    if not projects:
-        print("\nNo unposted projects found in the last "
-              f"{LOOKBACK_DAYS} days.")
-        return
-
-    print(f"\nFound {len(projects)} unposted project(s) total.")
-    if MAX_POSTS:
-        projects = projects[:MAX_POSTS]
-        print(f"Capped at {MAX_POSTS} post(s) for this run.")
-
     # ── Set up browser once ───────────────────────────────────────────────────
     driver = None
     if not IS_DRY_RUN:
         driver = get_driver()
 
+    # ── Lazy generator: scans one date at a time, yields projects immediately.
+    # Posting starts as soon as today's first project is found — no full
+    # upfront scan across all 30 lookback days before the first post begins.
+    # ─────────────────────────────────────────────────────────────────────────
+    gen = iter_unposted_projects(service, posted_ids, LOOKBACK_DAYS)
+
+    # Peek at the very first item to detect the "nothing found" case cleanly.
+    first = next(gen, None)
+    if first is None:
+        print(f"\nNo unposted projects found in the last {LOOKBACK_DAYS} days.")
+        return
+
+    # Re-attach the peeked item so the post loop sees it.
+    projects = itertools.chain([first], gen)
+
     # ── Post loop ─────────────────────────────────────────────────────────────
     posted_count = 0
-    for i, project in enumerate(projects):
-        success = process_project(service, project, driver, session, posted_ids)
+    total_seen   = 0
 
+    for project in projects:
+        total_seen += 1
+
+        if MAX_POSTS and posted_count >= MAX_POSTS:
+            print(f"\nReached max posts limit ({MAX_POSTS}). Stopping.")
+            break
+
+        success = process_project(service, project, driver, session, posted_ids)
         if success:
             posted_count += 1
 
-        # Wait between posts (but not after the last one)
-        remaining = len(projects) - i - 1
-        if remaining > 0 and (success or True):  # wait even on failure to be safe
-            print(f"\n  ⏳ Waiting {POST_WAIT_SECONDS // 60} minutes before next post "
-                  f"({remaining} remaining)...")
-            if not IS_DRY_RUN:
-                time.sleep(POST_WAIT_SECONDS)
-            else:
-                print("  [Dry Run] Skipping wait.")
+        # Peek at the next project to decide whether to wait.
+        # If nothing follows we're done; skip the inter-post wait.
+        next_project = next(projects, None)
+        if next_project is None:
+            break
+
+        if MAX_POSTS and posted_count >= MAX_POSTS:
+            print(f"\nReached max posts limit ({MAX_POSTS}). Stopping.")
+            break
+
+        print(f"\n  ⏳ Waiting {POST_WAIT_SECONDS // 60} minutes before next post...")
+        if not IS_DRY_RUN:
+            time.sleep(POST_WAIT_SECONDS)
+        else:
+            print("  [Dry Run] Skipping wait.")
+
+        # Re-chain the peeked item back onto the front so the for-loop
+        # picks it up on the next iteration.
+        projects = itertools.chain([next_project], projects)
 
     print(f"\n{'='*60}")
-    print(f"Done. Posted {posted_count}/{len(projects)} project(s).")
+    print(f"Done. Posted {posted_count}/{total_seen} project(s) processed.")
     print(f"{'='*60}")
 
 
