@@ -2,7 +2,7 @@ name: X-Post-Automation
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 */3 * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -320,6 +320,15 @@ jobs:
 
           .venv/bin/python scripts/post_to_x.py $DRY_RUN_ARG
 
+      - name: Run X-Reply
+        run: |
+          DRY_RUN_ARG=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_RUN_ARG="--dry-run"
+          fi
+          .venv/bin/python scripts/reply_on_x.py $DRY_RUN_ARG
+
+
       # -------------------------------------------------------
       # SAVE STATE
       # -------------------------------------------------------
@@ -327,9 +336,9 @@ jobs:
       - name: Commit and Push State Changes
         if: always()
         run: |
-          touch posted-ids.json
-          git add posted-ids.json || true
-          git commit -m "Update posted IDs [skip ci]" || echo "No changes to commit"
+          touch posted-ids.json replied-stats.json
+          git add posted-ids.json replied-stats.json || true
+          git commit -m "Update state tracking [skip ci]" || echo "No changes to commit"
           git push origin HEAD || true
 
       - name: Save Antigravity Data Session
